@@ -1,0 +1,447 @@
+import React, { useState, useEffect, useRef } from 'react';
+
+// --- INITIAL STATE ---
+const INITIAL_DB = {
+  tasks: [],
+  workers: [],
+  submissions: [], // ADDED: Required for the QC and Worker execution loops
+  signoffs: [],    // Executive agent requests human approval
+  comms: [],       // Messages sent by Comms agent
+  logs: [],
+  metrics: { tasks_generated: 0, solutions_accepted: 0, tasks_failed: 0, total_spent: 0 }
+};
+
+// --- UTILS ---
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const generateId = (prefix) => `${prefix}_${Math.random().toString(36).substr(2, 6)}`;
+const addLog = (draft, agent, msg, color) => {
+  draft.logs.push({ id: generateId('log'), agent, msg, color });
+  if (draft.logs.length > 50) draft.logs.shift();
+};
+
+// --- AGENT LOGIC (Autonomous Loop) ---
+
+// 1. PIPELINE AGENT: Generates python-like tasks, manages supply
+const pipelineAgent = (draft) => {
+  const unassigned = draft.tasks.filter(t => t.status === 'unassigned');
+  if (unassigned.length < 8) {
+    for (let i = 0; i < 3; i++) {
+      draft.metrics.tasks_generated += 1;
+      const isTier2 = Math.random() > 0.6;
+      draft.tasks.push({
+        id: `TASK-${draft.metrics.tasks_generated}`,
+        repo: isTier2 ? 'sqlglot' : 'pydantic',
+        tier: isTier2 ? 2 : 1,
+        desc: isTier2 ? 'Fix AST transformation bug in dialect' : 'Handle edge case in validator',
+        status: 'unassigned',
+        assigned_to: null,
+      });
+    }
+    addLog(draft, 'Pipeline', 'Generated 3 new tasks via SWE-smith.', 'text-blue-400');
+  }
+};
+
+// 2. RECRUITING AGENT: Monitors capacity, proposes hires via sign-offs
+const recruitingAgent = (draft) => {
+  const unassignedTasks = draft.tasks.filter(t => t.status === 'unassigned').length;
+  const activeWorkers = draft.workers.filter(w => w.status !== 'offboarded').length;
+  const pendingHires = draft.signoffs.filter(s => s.type === 'hire' && s.status === 'pending').length;
+  
+  if (unassignedTasks > (activeWorkers * 2) && pendingHires === 0) {
+    const batchSize = Math.max(2, Math.floor(unassignedTasks / 2));
+    draft.signoffs.push({
+      id: generateId('req'),
+      type: 'hire',
+      agent: 'Recruiting Agent',
+      title: `Hire Batch of ${batchSize} Workers`,
+      desc: `Queue depth exceeds capacity. Sourced ${batchSize} verified candidates via RentAHuman.`,
+      status: 'pending',
+      payload: { count: batchSize }
+    });
+    addLog(draft, 'Recruiting', `Drafted sign-off to hire ${batchSize} workers.`, 'text-purple-400');
+  }
+};
+
+// 3. PM AGENT: Assigns work, tracks performance, warns/promotes/dismisses
+const pmAgent = (draft) => {
+  // Check for stuck tasks (simulated timeout)
+  draft.workers.filter(w => w.status === 'working').forEach(w => {
+    w.ticks_working = (w.ticks_working || 0) + 1;
+    if (w.ticks_working > 15) { // Worker stuck
+      const task = draft.tasks.find(t => t.id === w.current_task);
+      if (task) {
+        task.status = 'unassigned'; task.assigned_to = null;
+      }
+      w.status = 'idle'; w.current_task = null; w.ticks_working = 0;
+      
+      draft.comms.unshift({ id: generateId('msg'), type: 'warning', to: w.id, msg: `Task timeout on ${task?.id}. Task reassigned.` });
+      addLog(draft, 'PM Agent', `Reassigned ${task?.id} due to worker timeout.`, 'text-yellow-500');
+    }
+  });
+
+  // Assign Tasks
+  const idleWorkers = draft.workers.filter(w => w.status === 'idle');
+  const unassignedTasks = draft.tasks.filter(t => t.status === 'unassigned');
+
+  idleWorkers.forEach(worker => {
+    const idx = unassignedTasks.findIndex(t => t.tier <= worker.tier);
+    if (idx !== -1) {
+      const task = unassignedTasks.splice(idx, 1)[0];
+      task.status = 'working';
+      task.assigned_to = worker.id;
+      worker.status = 'working';
+      worker.current_task = task.id;
+      worker.ticks_working = 0;
+      addLog(draft, 'PM Agent', `Assigned ${task.id} to ${worker.id}`, 'text-slate-400');
+    }
+  });
+
+  // Review Performance
+  draft.workers.forEach(w => {
+    if (w.status === 'offboarded') return;
+    if (w.history.length >= 3) {
+      const recent = w.history.slice(-3);
+      const passes = recent.filter(r => r === 'pass').length;
+      w.pass_rate = passes / recent.length;
+
+      // Promotion logic
+      if (w.tier === 1 && w.pass_rate >= 0.8 && !w.has_been_promoted) {
+        w.tier = 2;
+        w.has_been_promoted = true;
+        draft.comms.unshift({ id: generateId('msg'), type: 'promotion', to: w.id, msg: `Congratulations! You've been promoted to Tier 2 based on your >80% pass rate.` });
+        addLog(draft, 'PM Agent', `Promoted ${w.id} to Tier 2.`, 'text-yellow-400');
+      }
+      
+      // Dismissal logic (requires signoff)
+      if (w.pass_rate < 0.3 && w.history.length >= 4 && !draft.signoffs.some(s => s.payload?.worker_id === w.id)) {
+        draft.signoffs.push({
+          id: generateId('req'), type: 'dismiss', agent: 'PM Agent',
+          title: `Offboard Underperformer: ${w.id}`,
+          desc: `Worker ${w.id} has a pass rate of ${(w.pass_rate*100).toFixed(0)}%. Requesting dismissal.`,
+          status: 'pending', payload: { worker_id: w.id }
+        });
+        addLog(draft, 'PM Agent', `Drafted sign-off to dismiss ${w.id}.`, 'text-red-400');
+      }
+    }
+  });
+};
+
+// SIMULATED WORKER EXECUTION (The actual "doing" of the task)
+const workerExecution = (draft) => {
+  draft.workers.filter(w => w.status === 'working').forEach(worker => {
+    if (Math.random() > 0.8) { // 20% chance to submit per tick
+      const task = draft.tasks.find(t => t.id === worker.current_task);
+      if (!task) return;
+      
+      const isSuccess = Math.random() < worker.skill;
+      const errorType = isSuccess ? null : (Math.random() > 0.5 ? 'AssertionError: Expected 4, got 5' : 'Timeout: Test took >10s');
+      
+      draft.submissions.push({
+        id: generateId('sub'), task_id: task.id, worker_id: worker.id,
+        status: 'pending_qc', is_success: isSuccess, error: errorType
+      });
+      task.status = 'in_qc';
+      worker.status = 'idle';
+      worker.current_task = null;
+    }
+  });
+};
+
+// 4. QC AGENT: Grades deterministically, triggers Comms
+const qcAgent = (draft) => {
+  const pending = draft.submissions.filter(s => s.status === 'pending_qc');
+  pending.forEach(sub => {
+    const task = draft.tasks.find(t => t.id === sub.task_id);
+    const worker = draft.workers.find(w => w.id === sub.worker_id);
+    
+    if (sub.is_success) {
+      // Pass + Secondary QC check
+      sub.status = 'accepted';
+      task.status = 'completed';
+      worker.history.push('pass');
+      draft.metrics.solutions_accepted += 1;
+      draft.metrics.total_spent += (task.tier === 1 ? 25 : 50); // Paid for success
+      
+      const hasSecondaryFlag = Math.random() > 0.9; // 10% chance of "gaming" flag
+      if (hasSecondaryFlag) {
+        draft.comms.unshift({ id: generateId('msg'), type: 'warning', to: worker.id, msg: `Secondary QC Flag on ${task.id}: Patch oversized. Reviewing for hardcoding.`});
+        addLog(draft, 'QC Agent', `PASS w/ FLAG: ${task.id} by ${worker.id}`, 'text-yellow-300');
+      } else {
+        draft.comms.unshift({ id: generateId('msg'), type: 'success', to: worker.id, msg: `Solution accepted for ${task.id}. Payment credited.` });
+        addLog(draft, 'QC Agent', `PASS: ${task.id} by ${worker.id}`, 'text-green-400');
+      }
+
+    } else {
+      sub.status = 'returned';
+      task.status = 'unassigned';
+      task.assigned_to = null;
+      worker.history.push('fail');
+      draft.metrics.tasks_failed += 1;
+      
+      draft.comms.unshift({ id: generateId('msg'), type: 'error', to: worker.id, msg: `Failed ${task.id}.\nTraceback: ${sub.error}` });
+      addLog(draft, 'QC Agent', `FAIL: ${task.id} by ${worker.id}`, 'text-red-400');
+    }
+  });
+  
+  if (draft.comms.length > 30) draft.comms = draft.comms.slice(0, 30);
+};
+
+
+// --- REACT COMPONENT ---
+export default function App() {
+  const [db, setDb] = useState(INITIAL_DB);
+  const [isRunning, setIsRunning] = useState(false);
+  const [tick, setTick] = useState(0);
+  const [speed, setSpeed] = useState(1000);
+  const logsEndRef = useRef(null);
+
+  // Simulation Loop
+  useEffect(() => {
+    if (!isRunning) return;
+    const interval = setInterval(() => {
+      setTick(t => t + 1);
+      setDb(prev => {
+        const draft = JSON.parse(JSON.stringify(prev));
+        const ct = tick + 1;
+        
+        workerExecution(draft); // Workers doing work
+        qcAgent(draft);         // Every tick
+        if (ct % 2 === 0) pmAgent(draft);
+        if (ct % 3 === 0) recruitingAgent(draft);
+        if (ct % 4 === 0) pipelineAgent(draft);
+        
+        return draft;
+      });
+    }, speed);
+    return () => clearInterval(interval);
+  }, [isRunning, tick, speed]);
+
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [db.logs]);
+
+  // Handle Executive Sign-offs (Human Operator Actions)
+  const handleSignoff = (reqId, isApproved) => {
+    setDb(prev => {
+      const draft = JSON.parse(JSON.stringify(prev));
+      const req = draft.signoffs.find(s => s.id === reqId);
+      if (!req || req.status !== 'pending') return draft;
+
+      req.status = isApproved ? 'approved' : 'rejected';
+      
+      if (isApproved) {
+        if (req.type === 'hire') {
+          for (let i=0; i<req.payload.count; i++) {
+            const wId = `expert_${randomInt(10, 99)}`;
+            draft.workers.push({
+              id: wId, skill: parseFloat((Math.random() * 0.6 + 0.35).toFixed(2)),
+              tier: 1, status: 'idle', history: [], pass_rate: 0
+            });
+          }
+          addLog(draft, 'Executive', `Approved hiring of ${req.payload.count} workers.`, 'text-white font-bold');
+        } 
+        else if (req.type === 'dismiss') {
+          const w = draft.workers.find(w => w.id === req.payload.worker_id);
+          if (w) w.status = 'offboarded';
+          draft.comms.unshift({ id: generateId('msg'), type: 'error', to: w.id, msg: `Your RentAHuman contract has been terminated due to low quality.` });
+          addLog(draft, 'Executive', `Approved dismissal of ${w.id}.`, 'text-white font-bold');
+        }
+      } else {
+        addLog(draft, 'Executive', `Rejected ${req.type} request.`, 'text-gray-400');
+      }
+      return draft;
+    });
+  };
+
+  const activeWorkers = db.workers.filter(w => w.status !== 'offboarded');
+  const pendingSignoffs = db.signoffs.filter(s => s.status === 'pending');
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-slate-300 p-4 lg:p-6 font-sans flex flex-col gap-6">
+      
+      {/* HEADER & CONTROLS */}
+      <div className="flex flex-col md:flex-row justify-between items-center bg-neutral-900 border border-neutral-800 p-4 rounded-xl shadow-md">
+        <div>
+          <h1 className="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
+            <span className="w-3 h-3 rounded-full bg-blue-500 animate-pulse"></span>
+            SWE-Data Orchestrator
+          </h1>
+          <p className="text-slate-500 text-sm mt-1">Autonomous Multi-Agent Benchmarking Loop</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-4 mt-4 md:mt-0">
+          <div className="flex items-center gap-2 bg-neutral-800 px-3 py-1.5 rounded-md">
+            <span className="text-xs text-slate-400 font-medium">CLOCK Tस्पीड</span>
+            <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} className="bg-transparent border-none text-white text-sm focus:ring-0 cursor-pointer outline-none">
+              <option value={1500}>1.5s / Tick</option>
+              <option value={800}>0.8s / Tick</option>
+              <option value={200}>0.2s / Tick</option>
+            </select>
+          </div>
+          <button onClick={() => setIsRunning(!isRunning)} className={`px-5 py-2 rounded-md font-semibold text-white shadow-sm transition-all ${isRunning ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/20'}`}>
+            {isRunning ? '⏸ Pause Pipeline' : '▶ Start Pipeline'}
+          </button>
+        </div>
+      </div>
+
+      {/* METRICS ROW */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        {[
+          { label: 'System Ticks', val: tick, color: 'text-white' },
+          { label: 'Active Queue', val: db.tasks.filter(t=>t.status==='unassigned').length, color: 'text-blue-400' },
+          { label: 'Active Experts', val: activeWorkers.length, color: 'text-purple-400' },
+          { label: 'Total Accepted', val: db.metrics.solutions_accepted, color: 'text-green-400' },
+          { label: 'Platform Spend', val: `$${db.metrics.total_spent}`, color: 'text-yellow-400' }
+        ].map((m, i) => (
+          <div key={i} className="bg-neutral-900 border border-neutral-800 p-3 rounded-lg">
+            <div className="text-neutral-500 text-[10px] font-bold uppercase tracking-wider">{m.label}</div>
+            <div className={`text-2xl font-mono mt-1 ${m.color}`}>{m.val}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-4 gap-6 flex-1 min-h-[600px]">
+        
+        {/* COLUMN 1: EXECUTIVE INBOX & COMMS FEED */}
+        <div className="flex flex-col gap-6 xl:col-span-1 h-full">
+          {/* Executive Inbox */}
+          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
+            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
+              <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                Executive Inbox {pendingSignoffs.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{pendingSignoffs.length}</span>}
+              </h2>
+            </div>
+            <div className="overflow-y-auto p-3 flex-1 space-y-3">
+              {pendingSignoffs.length === 0 ? (
+                <div className="text-neutral-500 text-xs text-center py-8">No pending sign-offs.</div>
+              ) : (
+                pendingSignoffs.map(req => (
+                  <div key={req.id} className="bg-neutral-950 border border-neutral-700 p-3 rounded-lg flex flex-col gap-2">
+                    <div className="flex justify-between items-start">
+                      <span className="text-[10px] text-neutral-400 font-mono uppercase bg-neutral-800 px-1.5 py-0.5 rounded">{req.agent}</span>
+                    </div>
+                    <div className="text-sm text-white font-medium">{req.title}</div>
+                    <div className="text-xs text-neutral-400 leading-relaxed">{req.desc}</div>
+                    <div className="flex gap-2 mt-2">
+                      <button onClick={() => handleSignoff(req.id, true)} className="flex-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-600/50 rounded py-1 text-xs font-semibold transition-colors">Approve</button>
+                      <button onClick={() => handleSignoff(req.id, false)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded py-1 text-xs font-semibold transition-colors">Reject</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Comms Agent Feed */}
+          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
+            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800">
+              <h2 className="text-sm font-bold text-white">Comms Agent Outbox</h2>
+            </div>
+            <div className="overflow-y-auto p-3 flex-1 space-y-2">
+              {db.comms.map(msg => (
+                <div key={msg.id} className="bg-neutral-950 border border-neutral-800 p-2.5 rounded flex flex-col gap-1">
+                  <div className="flex justify-between items-center text-[10px]">
+                    <span className="text-neutral-500 font-mono">To: {msg.to}</span>
+                    <span className={`px-1.5 rounded-sm uppercase font-bold ${
+                      msg.type==='error'?'bg-red-500/10 text-red-400':
+                      msg.type==='success'?'bg-green-500/10 text-green-400':
+                      msg.type==='promotion'?'bg-yellow-500/10 text-yellow-400':'bg-orange-500/10 text-orange-400'
+                    }`}>{msg.type}</span>
+                  </div>
+                  <div className="text-xs text-neutral-300 whitespace-pre-wrap">{msg.msg}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* COLUMN 2: WORKFORCE & TASKS */}
+        <div className="flex flex-col gap-6 xl:col-span-2 h-full">
+          {/* Workforce */}
+          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col h-[48%] shadow-sm overflow-hidden">
+            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
+              <h2 className="text-sm font-bold text-white">Workforce State</h2>
+              <div className="text-[10px] text-neutral-400 font-mono">Managed by: PM Agent</div>
+            </div>
+            <div className="overflow-y-auto p-2 flex-1">
+              <table className="w-full text-left text-xs text-neutral-400 border-collapse">
+                <thead className="bg-neutral-950 sticky top-0">
+                  <tr>
+                    <th className="p-2 font-medium">Expert ID</th>
+                    <th className="p-2 font-medium">Status</th>
+                    <th className="p-2 font-medium">Tier</th>
+                    <th className="p-2 font-medium">Latent Skill</th>
+                    <th className="p-2 font-medium">Pass Rate</th>
+                    <th className="p-2 font-medium w-1/3">Recent History</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-neutral-800">
+                  {db.workers.slice().reverse().map(w => (
+                    <tr key={w.id} className={w.status==='offboarded'?'opacity-30 bg-neutral-950':'bg-neutral-900 hover:bg-neutral-800 transition-colors'}>
+                      <td className="p-2 font-mono text-neutral-200">{w.id}</td>
+                      <td className="p-2">
+                        <span className={`px-1.5 py-0.5 rounded font-medium text-[10px] uppercase ${w.status==='working'?'bg-blue-500/20 text-blue-400':w.status==='idle'?'bg-green-500/20 text-green-400':'bg-neutral-800 text-neutral-500'}`}>
+                          {w.status}
+                        </span>
+                      </td>
+                      <td className="p-2">{w.tier}</td>
+                      <td className="p-2">{w.skill}</td>
+                      <td className="p-2">{(w.pass_rate * 100).toFixed(0)}%</td>
+                      <td className="p-2 flex gap-1 flex-wrap">
+                        {w.history.slice(-6).map((h, i) => (
+                          <div key={i} className={`w-2 h-2 rounded-full ${h==='pass'?'bg-green-500':'bg-red-500'}`} title={h}/>
+                        ))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Tasks */}
+          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
+             <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
+              <h2 className="text-sm font-bold text-white">Live Pipeline Queue</h2>
+            </div>
+            <div className="overflow-y-auto p-2 flex-1 space-y-1.5">
+              {db.tasks.slice(-50).reverse().map(t => (
+                <div key={t.id} className="bg-neutral-950 border border-neutral-800 p-2 rounded flex justify-between items-center text-xs">
+                  <div className="flex gap-3 items-center">
+                    <span className="font-mono text-neutral-300 w-16">{t.id}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${t.repo==='sqlglot'?'bg-orange-500/10 text-orange-400':'bg-teal-500/10 text-teal-400'}`}>{t.repo}</span>
+                    <span className="text-neutral-400 truncate max-w-[150px] md:max-w-[200px]">{t.desc}</span>
+                  </div>
+                  <div className="flex gap-4 items-center">
+                    {t.assigned_to && <span className="text-neutral-500 font-mono text-[10px]">Asg: {t.assigned_to}</span>}
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium min-w-[70px] text-center ${
+                      t.status === 'unassigned' ? 'bg-neutral-800 text-neutral-400' :
+                      t.status === 'working' ? 'bg-blue-500/20 text-blue-400' :
+                      t.status === 'in_qc' ? 'bg-purple-500/20 text-purple-400' :
+                      'bg-green-500/20 text-green-400'
+                    }`}>
+                      {t.status.replace('_', ' ')}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* COLUMN 3: TERMINAL LOGS */}
+        <div className="bg-[#0D1117] rounded-xl border border-neutral-800 flex flex-col xl:col-span-1 shadow-inner h-full overflow-hidden font-mono">
+          <div className="p-2 border-b border-neutral-800 bg-[#161B22] flex items-center justify-between">
+            <div className="flex gap-1.5 pl-1">
+              <div className="w-2.5 h-2.5 rounded-full bg-red-500/80"></div>
+              <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/80"></div>
+              <div className="w-2.5 h-2.5 rounded-full bg-green-500/80"></div>
+            </div>
+            <span className="text-[10px] text-neutral-500 font-bold pr-2">docker-agent-logs</span>
+          </div>
+          <div className="overflow-y-auto flex-1 p-3 space-y-1.5 text-[11px] tracking-tight leading-relaxed">
+            {db.logs.map((log) => (
+              <div key={log.id} className="flex gap-2 break-words">
+                <span className="text-neutral-600 shrink-0 w-[70px] text-right">[{log.agent}]</span>
+                <span className={`${log.color} flex-1`}>{log.msg}</span>
+              </div>
+            ))}
+            <div ref={logsEndRef} />
+          </div>
