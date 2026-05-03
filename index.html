@@ -1,447 +1,986 @@
-import React, { useState, useEffect, useRef } from 'react';
-
-// --- INITIAL STATE ---
-const INITIAL_DB = {
-  tasks: [],
-  workers: [],
-  submissions: [], // ADDED: Required for the QC and Worker execution loops
-  signoffs: [],    // Executive agent requests human approval
-  comms: [],       // Messages sent by Comms agent
-  logs: [],
-  metrics: { tasks_generated: 0, solutions_accepted: 0, tasks_failed: 0, total_spent: 0 }
-};
-
-// --- UTILS ---
-const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-const generateId = (prefix) => `${prefix}_${Math.random().toString(36).substr(2, 6)}`;
-const addLog = (draft, agent, msg, color) => {
-  draft.logs.push({ id: generateId('log'), agent, msg, color });
-  if (draft.logs.length > 50) draft.logs.shift();
-};
-
-// --- AGENT LOGIC (Autonomous Loop) ---
-
-// 1. PIPELINE AGENT: Generates python-like tasks, manages supply
-const pipelineAgent = (draft) => {
-  const unassigned = draft.tasks.filter(t => t.status === 'unassigned');
-  if (unassigned.length < 8) {
-    for (let i = 0; i < 3; i++) {
-      draft.metrics.tasks_generated += 1;
-      const isTier2 = Math.random() > 0.6;
-      draft.tasks.push({
-        id: `TASK-${draft.metrics.tasks_generated}`,
-        repo: isTier2 ? 'sqlglot' : 'pydantic',
-        tier: isTier2 ? 2 : 1,
-        desc: isTier2 ? 'Fix AST transformation bug in dialect' : 'Handle edge case in validator',
-        status: 'unassigned',
-        assigned_to: null,
-      });
-    }
-    addLog(draft, 'Pipeline', 'Generated 3 new tasks via SWE-smith.', 'text-blue-400');
-  }
-};
-
-// 2. RECRUITING AGENT: Monitors capacity, proposes hires via sign-offs
-const recruitingAgent = (draft) => {
-  const unassignedTasks = draft.tasks.filter(t => t.status === 'unassigned').length;
-  const activeWorkers = draft.workers.filter(w => w.status !== 'offboarded').length;
-  const pendingHires = draft.signoffs.filter(s => s.type === 'hire' && s.status === 'pending').length;
-  
-  if (unassignedTasks > (activeWorkers * 2) && pendingHires === 0) {
-    const batchSize = Math.max(2, Math.floor(unassignedTasks / 2));
-    draft.signoffs.push({
-      id: generateId('req'),
-      type: 'hire',
-      agent: 'Recruiting Agent',
-      title: `Hire Batch of ${batchSize} Workers`,
-      desc: `Queue depth exceeds capacity. Sourced ${batchSize} verified candidates via RentAHuman.`,
-      status: 'pending',
-      payload: { count: batchSize }
-    });
-    addLog(draft, 'Recruiting', `Drafted sign-off to hire ${batchSize} workers.`, 'text-purple-400');
-  }
-};
-
-// 3. PM AGENT: Assigns work, tracks performance, warns/promotes/dismisses
-const pmAgent = (draft) => {
-  // Check for stuck tasks (simulated timeout)
-  draft.workers.filter(w => w.status === 'working').forEach(w => {
-    w.ticks_working = (w.ticks_working || 0) + 1;
-    if (w.ticks_working > 15) { // Worker stuck
-      const task = draft.tasks.find(t => t.id === w.current_task);
-      if (task) {
-        task.status = 'unassigned'; task.assigned_to = null;
-      }
-      w.status = 'idle'; w.current_task = null; w.ticks_working = 0;
-      
-      draft.comms.unshift({ id: generateId('msg'), type: 'warning', to: w.id, msg: `Task timeout on ${task?.id}. Task reassigned.` });
-      addLog(draft, 'PM Agent', `Reassigned ${task?.id} due to worker timeout.`, 'text-yellow-500');
-    }
-  });
-
-  // Assign Tasks
-  const idleWorkers = draft.workers.filter(w => w.status === 'idle');
-  const unassignedTasks = draft.tasks.filter(t => t.status === 'unassigned');
-
-  idleWorkers.forEach(worker => {
-    const idx = unassignedTasks.findIndex(t => t.tier <= worker.tier);
-    if (idx !== -1) {
-      const task = unassignedTasks.splice(idx, 1)[0];
-      task.status = 'working';
-      task.assigned_to = worker.id;
-      worker.status = 'working';
-      worker.current_task = task.id;
-      worker.ticks_working = 0;
-      addLog(draft, 'PM Agent', `Assigned ${task.id} to ${worker.id}`, 'text-slate-400');
-    }
-  });
-
-  // Review Performance
-  draft.workers.forEach(w => {
-    if (w.status === 'offboarded') return;
-    if (w.history.length >= 3) {
-      const recent = w.history.slice(-3);
-      const passes = recent.filter(r => r === 'pass').length;
-      w.pass_rate = passes / recent.length;
-
-      // Promotion logic
-      if (w.tier === 1 && w.pass_rate >= 0.8 && !w.has_been_promoted) {
-        w.tier = 2;
-        w.has_been_promoted = true;
-        draft.comms.unshift({ id: generateId('msg'), type: 'promotion', to: w.id, msg: `Congratulations! You've been promoted to Tier 2 based on your >80% pass rate.` });
-        addLog(draft, 'PM Agent', `Promoted ${w.id} to Tier 2.`, 'text-yellow-400');
-      }
-      
-      // Dismissal logic (requires signoff)
-      if (w.pass_rate < 0.3 && w.history.length >= 4 && !draft.signoffs.some(s => s.payload?.worker_id === w.id)) {
-        draft.signoffs.push({
-          id: generateId('req'), type: 'dismiss', agent: 'PM Agent',
-          title: `Offboard Underperformer: ${w.id}`,
-          desc: `Worker ${w.id} has a pass rate of ${(w.pass_rate*100).toFixed(0)}%. Requesting dismissal.`,
-          status: 'pending', payload: { worker_id: w.id }
-        });
-        addLog(draft, 'PM Agent', `Drafted sign-off to dismiss ${w.id}.`, 'text-red-400');
-      }
-    }
-  });
-};
-
-// SIMULATED WORKER EXECUTION (The actual "doing" of the task)
-const workerExecution = (draft) => {
-  draft.workers.filter(w => w.status === 'working').forEach(worker => {
-    if (Math.random() > 0.8) { // 20% chance to submit per tick
-      const task = draft.tasks.find(t => t.id === worker.current_task);
-      if (!task) return;
-      
-      const isSuccess = Math.random() < worker.skill;
-      const errorType = isSuccess ? null : (Math.random() > 0.5 ? 'AssertionError: Expected 4, got 5' : 'Timeout: Test took >10s');
-      
-      draft.submissions.push({
-        id: generateId('sub'), task_id: task.id, worker_id: worker.id,
-        status: 'pending_qc', is_success: isSuccess, error: errorType
-      });
-      task.status = 'in_qc';
-      worker.status = 'idle';
-      worker.current_task = null;
-    }
-  });
-};
-
-// 4. QC AGENT: Grades deterministically, triggers Comms
-const qcAgent = (draft) => {
-  const pending = draft.submissions.filter(s => s.status === 'pending_qc');
-  pending.forEach(sub => {
-    const task = draft.tasks.find(t => t.id === sub.task_id);
-    const worker = draft.workers.find(w => w.id === sub.worker_id);
-    
-    if (sub.is_success) {
-      // Pass + Secondary QC check
-      sub.status = 'accepted';
-      task.status = 'completed';
-      worker.history.push('pass');
-      draft.metrics.solutions_accepted += 1;
-      draft.metrics.total_spent += (task.tier === 1 ? 25 : 50); // Paid for success
-      
-      const hasSecondaryFlag = Math.random() > 0.9; // 10% chance of "gaming" flag
-      if (hasSecondaryFlag) {
-        draft.comms.unshift({ id: generateId('msg'), type: 'warning', to: worker.id, msg: `Secondary QC Flag on ${task.id}: Patch oversized. Reviewing for hardcoding.`});
-        addLog(draft, 'QC Agent', `PASS w/ FLAG: ${task.id} by ${worker.id}`, 'text-yellow-300');
-      } else {
-        draft.comms.unshift({ id: generateId('msg'), type: 'success', to: worker.id, msg: `Solution accepted for ${task.id}. Payment credited.` });
-        addLog(draft, 'QC Agent', `PASS: ${task.id} by ${worker.id}`, 'text-green-400');
-      }
-
-    } else {
-      sub.status = 'returned';
-      task.status = 'unassigned';
-      task.assigned_to = null;
-      worker.history.push('fail');
-      draft.metrics.tasks_failed += 1;
-      
-      draft.comms.unshift({ id: generateId('msg'), type: 'error', to: worker.id, msg: `Failed ${task.id}.\nTraceback: ${sub.error}` });
-      addLog(draft, 'QC Agent', `FAIL: ${task.id} by ${worker.id}`, 'text-red-400');
-    }
-  });
-  
-  if (draft.comms.length > 30) draft.comms = draft.comms.slice(0, 30);
-};
-
-
-// --- REACT COMPONENT ---
-export default function App() {
-  const [db, setDb] = useState(INITIAL_DB);
-  const [isRunning, setIsRunning] = useState(false);
-  const [tick, setTick] = useState(0);
-  const [speed, setSpeed] = useState(1000);
-  const logsEndRef = useRef(null);
-
-  // Simulation Loop
-  useEffect(() => {
-    if (!isRunning) return;
-    const interval = setInterval(() => {
-      setTick(t => t + 1);
-      setDb(prev => {
-        const draft = JSON.parse(JSON.stringify(prev));
-        const ct = tick + 1;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <base target="_top">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SWE-Data Orchestrator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Minimalist Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
         
-        workerExecution(draft); // Workers doing work
-        qcAgent(draft);         // Every tick
-        if (ct % 2 === 0) pmAgent(draft);
-        if (ct % 3 === 0) recruitingAgent(draft);
-        if (ct % 4 === 0) pipelineAgent(draft);
+        .modal-bg { backdrop-filter: blur(4px); }
         
-        return draft;
-      });
-    }, speed);
-    return () => clearInterval(interval);
-  }, [isRunning, tick, speed]);
+        /* Light Mode Markdown Rendering */
+        .markdown h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; color: #0f172a; }
+        .markdown h2 { font-size: 1rem; font-weight: 600; margin-top: 1rem; margin-bottom: 0.25rem; color: #1e293b; }
+        .markdown p { margin-bottom: 0.5rem; color: #475569; line-height: 1.5; }
+        .markdown ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 0.5rem; color: #475569; }
+        .markdown code { background-color: #f1f5f9; padding: 0.125rem 0.25rem; border-radius: 0.25rem; font-family: monospace; font-size: 0.85em; color: #0369a1; }
+        .markdown pre code { background-color: transparent; padding: 0; color: inherit; }
+        .markdown pre { background-color: #f8fafc; padding: 0.75rem; border-radius: 0.5rem; overflow-x: auto; margin-bottom: 0.75rem; border: 1px solid #e2e8f0; color: #334155; font-family: monospace; font-size: 0.85em;}
+        .markdown blockquote { border-left: 3px solid #fbbf24; padding-left: 0.75rem; color: #64748b; font-style: italic; margin-bottom: 0.75rem; }
+    </style>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-700 p-4 lg:p-6 font-sans flex flex-col gap-6 overflow-x-hidden">
 
-  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [db.logs]);
-
-  // Handle Executive Sign-offs (Human Operator Actions)
-  const handleSignoff = (reqId, isApproved) => {
-    setDb(prev => {
-      const draft = JSON.parse(JSON.stringify(prev));
-      const req = draft.signoffs.find(s => s.id === reqId);
-      if (!req || req.status !== 'pending') return draft;
-
-      req.status = isApproved ? 'approved' : 'rejected';
-      
-      if (isApproved) {
-        if (req.type === 'hire') {
-          for (let i=0; i<req.payload.count; i++) {
-            const wId = `expert_${randomInt(10, 99)}`;
-            draft.workers.push({
-              id: wId, skill: parseFloat((Math.random() * 0.6 + 0.35).toFixed(2)),
-              tier: 1, status: 'idle', history: [], pass_rate: 0
-            });
-          }
-          addLog(draft, 'Executive', `Approved hiring of ${req.payload.count} workers.`, 'text-white font-bold');
-        } 
-        else if (req.type === 'dismiss') {
-          const w = draft.workers.find(w => w.id === req.payload.worker_id);
-          if (w) w.status = 'offboarded';
-          draft.comms.unshift({ id: generateId('msg'), type: 'error', to: w.id, msg: `Your RentAHuman contract has been terminated due to low quality.` });
-          addLog(draft, 'Executive', `Approved dismissal of ${w.id}.`, 'text-white font-bold');
-        }
-      } else {
-        addLog(draft, 'Executive', `Rejected ${req.type} request.`, 'text-gray-400');
-      }
-      return draft;
-    });
-  };
-
-  const activeWorkers = db.workers.filter(w => w.status !== 'offboarded');
-  const pendingSignoffs = db.signoffs.filter(s => s.status === 'pending');
-
-  return (
-    <div className="min-h-screen bg-neutral-950 text-slate-300 p-4 lg:p-6 font-sans flex flex-col gap-6">
-      
-      {/* HEADER & CONTROLS */}
-      <div className="flex flex-col md:flex-row justify-between items-center bg-neutral-900 border border-neutral-800 p-4 rounded-xl shadow-md">
+    <!-- HEADER & CONTROLS -->
+    <div class="flex flex-col md:flex-row justify-between items-center bg-white border border-slate-200 p-4 rounded-2xl shadow-sm">
         <div>
-          <h1 className="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
-            <span className="w-3 h-3 rounded-full bg-blue-500 animate-pulse"></span>
-            SWE-Data Orchestrator
-          </h1>
-          <p className="text-slate-500 text-sm mt-1">Autonomous Multi-Agent Benchmarking Loop</p>
+            <h1 class="text-2xl font-bold text-slate-900 tracking-tight flex items-center gap-3">
+                <span class="w-3 h-3 rounded-full bg-blue-500 animate-pulse shadow-[0_0_8px_rgba(59,130,246,0.5)]"></span>
+                SWE-Data Orchestrator
+            </h1>
+            <p class="text-slate-500 text-sm mt-1">High-Fidelity Autonomous Multi-Agent Simulation</p>
         </div>
-        <div className="flex flex-wrap items-center gap-4 mt-4 md:mt-0">
-          <div className="flex items-center gap-2 bg-neutral-800 px-3 py-1.5 rounded-md">
-            <span className="text-xs text-slate-400 font-medium">CLOCK Tस्पीड</span>
-            <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} className="bg-transparent border-none text-white text-sm focus:ring-0 cursor-pointer outline-none">
-              <option value={1500}>1.5s / Tick</option>
-              <option value={800}>0.8s / Tick</option>
-              <option value={200}>0.2s / Tick</option>
-            </select>
-          </div>
-          <button onClick={() => setIsRunning(!isRunning)} className={`px-5 py-2 rounded-md font-semibold text-white shadow-sm transition-all ${isRunning ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/20'}`}>
-            {isRunning ? '⏸ Pause Pipeline' : '▶ Start Pipeline'}
-          </button>
+        <div class="flex flex-wrap items-center gap-4 mt-4 md:mt-0">
+            <div class="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-200">
+                <span class="text-xs text-slate-500 font-medium">CLOCK SPEED</span>
+                <select id="speed-select" class="bg-transparent border-none text-slate-800 font-medium text-sm focus:ring-0 cursor-pointer outline-none">
+                    <option value="1500">1.5s / Tick (Slow)</option>
+                    <option value="800" selected>0.8s / Tick (Normal)</option>
+                    <option value="200">0.2s / Tick (Fast)</option>
+                </select>
+            </div>
+            <button id="toggle-btn" class="px-6 py-2 rounded-lg font-semibold text-white shadow-sm transition-all bg-slate-900 hover:bg-slate-800">
+                ▶ Start Pipeline
+            </button>
         </div>
-      </div>
+    </div>
 
-      {/* METRICS ROW */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        {[
-          { label: 'System Ticks', val: tick, color: 'text-white' },
-          { label: 'Active Queue', val: db.tasks.filter(t=>t.status==='unassigned').length, color: 'text-blue-400' },
-          { label: 'Active Experts', val: activeWorkers.length, color: 'text-purple-400' },
-          { label: 'Total Accepted', val: db.metrics.solutions_accepted, color: 'text-green-400' },
-          { label: 'Platform Spend', val: `$${db.metrics.total_spent}`, color: 'text-yellow-400' }
-        ].map((m, i) => (
-          <div key={i} className="bg-neutral-900 border border-neutral-800 p-3 rounded-lg">
-            <div className="text-neutral-500 text-[10px] font-bold uppercase tracking-wider">{m.label}</div>
-            <div className={`text-2xl font-mono mt-1 ${m.color}`}>{m.val}</div>
-          </div>
-        ))}
-      </div>
+    <!-- METRICS ROW -->
+    <div class="grid grid-cols-2 md:grid-cols-6 gap-4">
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider">System Ticks</div>
+            <div id="metric-ticks" class="text-2xl font-mono mt-1 text-slate-800 font-semibold">0</div>
+        </div>
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider">Writer Queue</div>
+            <div id="metric-queue" class="text-2xl font-mono mt-1 text-blue-600 font-semibold">0</div>
+        </div>
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider">Active Experts (A/B)</div>
+            <div id="metric-experts" class="text-xl font-mono mt-1 text-purple-600 font-semibold">0 / 0</div>
+        </div>
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center relative overflow-hidden">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider z-10">Solutions (Goal: 900)</div>
+            <div id="metric-accepted" class="text-2xl font-mono mt-1 text-emerald-600 font-semibold z-10">0</div>
+            <div id="metric-progress" class="absolute bottom-0 left-0 h-1 bg-emerald-400 w-0 transition-all duration-500"></div>
+        </div>
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider">Completed Tasks (3x)</div>
+            <div id="metric-3x" class="text-2xl font-mono mt-1 text-teal-600 font-semibold">0</div>
+        </div>
+        <div class="bg-white border border-slate-200 p-4 rounded-2xl shadow-sm flex flex-col justify-center">
+            <div class="text-slate-400 text-[10px] font-bold uppercase tracking-wider">Platform Spend</div>
+            <div id="metric-spend" class="text-2xl font-mono mt-1 text-amber-600 font-semibold">$0</div>
+        </div>
+    </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-4 gap-6 flex-1 min-h-[600px]">
+    <!-- AGENT INSPECTOR CONTROLS -->
+    <div class="bg-white border border-slate-200 p-3 rounded-2xl shadow-sm flex items-center justify-between overflow-x-auto gap-2">
+        <div class="text-xs text-slate-400 font-bold uppercase px-3 shrink-0">Inspect Agent Internals:</div>
+        <div class="flex gap-2 shrink-0 pr-2">
+            <button onclick="openAgentModal('Pipeline')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-blue-500"></span> Pipeline
+            </button>
+            <button onclick="openAgentModal('Recruiting')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-purple-500"></span> Recruiting
+            </button>
+            <button onclick="openAgentModal('PM')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 relative shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-slate-400"></span> PM & Instructions
+                <span id="pm-badge" class="hidden absolute -top-1.5 -right-1.5 bg-orange-500 text-white text-[10px] font-bold w-4 h-4 flex items-center justify-center rounded-full ring-2 ring-white">!</span>
+            </button>
+            <button onclick="openAgentModal('QC')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-emerald-500"></span> QC Eval
+            </button>
+            <button onclick="openAgentModal('Comms')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 relative shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-orange-500"></span> Comms & Support
+                <span id="comms-badge" class="hidden absolute -top-1.5 -right-1.5 bg-rose-500 text-white text-[10px] font-bold w-4 h-4 flex items-center justify-center rounded-full ring-2 ring-white">0</span>
+            </button>
+            <div class="w-px h-6 bg-slate-200 mx-1"></div>
+            <button onclick="openAgentModal('Engagement')" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-teal-500"></span> Client Report
+            </button>
+        </div>
+    </div>
+
+    <!-- MAIN DASHBOARD -->
+    <div class="grid grid-cols-1 xl:grid-cols-4 gap-6 flex-1 min-h-[500px]">
         
-        {/* COLUMN 1: EXECUTIVE INBOX & COMMS FEED */}
-        <div className="flex flex-col gap-6 xl:col-span-1 h-full">
-          {/* Executive Inbox */}
-          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
-            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
-              <h2 className="text-sm font-bold text-white flex items-center gap-2">
-                Executive Inbox {pendingSignoffs.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{pendingSignoffs.length}</span>}
-              </h2>
-            </div>
-            <div className="overflow-y-auto p-3 flex-1 space-y-3">
-              {pendingSignoffs.length === 0 ? (
-                <div className="text-neutral-500 text-xs text-center py-8">No pending sign-offs.</div>
-              ) : (
-                pendingSignoffs.map(req => (
-                  <div key={req.id} className="bg-neutral-950 border border-neutral-700 p-3 rounded-lg flex flex-col gap-2">
-                    <div className="flex justify-between items-start">
-                      <span className="text-[10px] text-neutral-400 font-mono uppercase bg-neutral-800 px-1.5 py-0.5 rounded">{req.agent}</span>
-                    </div>
-                    <div className="text-sm text-white font-medium">{req.title}</div>
-                    <div className="text-xs text-neutral-400 leading-relaxed">{req.desc}</div>
-                    <div className="flex gap-2 mt-2">
-                      <button onClick={() => handleSignoff(req.id, true)} className="flex-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-600/50 rounded py-1 text-xs font-semibold transition-colors">Approve</button>
-                      <button onClick={() => handleSignoff(req.id, false)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded py-1 text-xs font-semibold transition-colors">Reject</button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* Comms Agent Feed */}
-          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
-            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800">
-              <h2 className="text-sm font-bold text-white">Comms Agent Outbox</h2>
-            </div>
-            <div className="overflow-y-auto p-3 flex-1 space-y-2">
-              {db.comms.map(msg => (
-                <div key={msg.id} className="bg-neutral-950 border border-neutral-800 p-2.5 rounded flex flex-col gap-1">
-                  <div className="flex justify-between items-center text-[10px]">
-                    <span className="text-neutral-500 font-mono">To: {msg.to}</span>
-                    <span className={`px-1.5 rounded-sm uppercase font-bold ${
-                      msg.type==='error'?'bg-red-500/10 text-red-400':
-                      msg.type==='success'?'bg-green-500/10 text-green-400':
-                      msg.type==='promotion'?'bg-yellow-500/10 text-yellow-400':'bg-orange-500/10 text-orange-400'
-                    }`}>{msg.type}</span>
-                  </div>
-                  <div className="text-xs text-neutral-300 whitespace-pre-wrap">{msg.msg}</div>
+        <!-- COLUMN 1: EXECUTIVE INBOX -->
+        <div class="flex flex-col gap-6 xl:col-span-1 h-full">
+            <div class="bg-white rounded-2xl border border-slate-200 flex flex-col flex-1 shadow-sm overflow-hidden">
+                <div class="px-4 py-3 bg-white border-b border-slate-100 flex justify-between items-center">
+                    <h2 class="text-sm font-bold text-slate-800 flex items-center gap-2">
+                        Executive Sign-offs 
+                        <span id="inbox-badge" class="hidden bg-rose-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">0</span>
+                    </h2>
                 </div>
-              ))}
+                <div id="signoffs-container" class="overflow-y-auto p-4 flex-1 space-y-4 bg-slate-50/50">
+                    <div class="text-slate-400 text-xs text-center py-8">System nominal. No pending actions.</div>
+                </div>
             </div>
-          </div>
+            
+            <div class="bg-white rounded-2xl border border-slate-200 flex flex-col h-[40%] shadow-sm overflow-hidden">
+                <div class="px-4 py-3 bg-white border-b border-slate-100">
+                    <h2 class="text-sm font-bold text-slate-800">Global Broadcasts</h2>
+                </div>
+                <div id="comms-container-mini" class="overflow-y-auto p-4 flex-1 space-y-3 bg-slate-50/50"></div>
+            </div>
         </div>
 
-        {/* COLUMN 2: WORKFORCE & TASKS */}
-        <div className="flex flex-col gap-6 xl:col-span-2 h-full">
-          {/* Workforce */}
-          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col h-[48%] shadow-sm overflow-hidden">
-            <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
-              <h2 className="text-sm font-bold text-white">Workforce State</h2>
-              <div className="text-[10px] text-neutral-400 font-mono">Managed by: PM Agent</div>
-            </div>
-            <div className="overflow-y-auto p-2 flex-1">
-              <table className="w-full text-left text-xs text-neutral-400 border-collapse">
-                <thead className="bg-neutral-950 sticky top-0">
-                  <tr>
-                    <th className="p-2 font-medium">Expert ID</th>
-                    <th className="p-2 font-medium">Status</th>
-                    <th className="p-2 font-medium">Tier</th>
-                    <th className="p-2 font-medium">Latent Skill</th>
-                    <th className="p-2 font-medium">Pass Rate</th>
-                    <th className="p-2 font-medium w-1/3">Recent History</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-neutral-800">
-                  {db.workers.slice().reverse().map(w => (
-                    <tr key={w.id} className={w.status==='offboarded'?'opacity-30 bg-neutral-950':'bg-neutral-900 hover:bg-neutral-800 transition-colors'}>
-                      <td className="p-2 font-mono text-neutral-200">{w.id}</td>
-                      <td className="p-2">
-                        <span className={`px-1.5 py-0.5 rounded font-medium text-[10px] uppercase ${w.status==='working'?'bg-blue-500/20 text-blue-400':w.status==='idle'?'bg-green-500/20 text-green-400':'bg-neutral-800 text-neutral-500'}`}>
-                          {w.status}
-                        </span>
-                      </td>
-                      <td className="p-2">{w.tier}</td>
-                      <td className="p-2">{w.skill}</td>
-                      <td className="p-2">{(w.pass_rate * 100).toFixed(0)}%</td>
-                      <td className="p-2 flex gap-1 flex-wrap">
-                        {w.history.slice(-6).map((h, i) => (
-                          <div key={i} className={`w-2 h-2 rounded-full ${h==='pass'?'bg-green-500':'bg-red-500'}`} title={h}/>
-                        ))}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Tasks */}
-          <div className="bg-neutral-900 rounded-xl border border-neutral-800 flex flex-col flex-1 shadow-sm overflow-hidden">
-             <div className="p-3 bg-neutral-800/50 border-b border-neutral-800 flex justify-between items-center">
-              <h2 className="text-sm font-bold text-white">Live Pipeline Queue</h2>
-            </div>
-            <div className="overflow-y-auto p-2 flex-1 space-y-1.5">
-              {db.tasks.slice(-50).reverse().map(t => (
-                <div key={t.id} className="bg-neutral-950 border border-neutral-800 p-2 rounded flex justify-between items-center text-xs">
-                  <div className="flex gap-3 items-center">
-                    <span className="font-mono text-neutral-300 w-16">{t.id}</span>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${t.repo==='sqlglot'?'bg-orange-500/10 text-orange-400':'bg-teal-500/10 text-teal-400'}`}>{t.repo}</span>
-                    <span className="text-neutral-400 truncate max-w-[150px] md:max-w-[200px]">{t.desc}</span>
-                  </div>
-                  <div className="flex gap-4 items-center">
-                    {t.assigned_to && <span className="text-neutral-500 font-mono text-[10px]">Asg: {t.assigned_to}</span>}
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium min-w-[70px] text-center ${
-                      t.status === 'unassigned' ? 'bg-neutral-800 text-neutral-400' :
-                      t.status === 'working' ? 'bg-blue-500/20 text-blue-400' :
-                      t.status === 'in_qc' ? 'bg-purple-500/20 text-purple-400' :
-                      'bg-green-500/20 text-green-400'
-                    }`}>
-                      {t.status.replace('_', ' ')}
-                    </span>
-                  </div>
+        <!-- COLUMN 2: WORKFORCE & TASKS -->
+        <div class="flex flex-col gap-6 xl:col-span-2 h-[800px] xl:h-full">
+            <div class="bg-white rounded-2xl border border-slate-200 flex flex-col h-[48%] shadow-sm overflow-hidden">
+                <div class="px-4 py-3 bg-white border-b border-slate-100 flex justify-between items-center">
+                    <h2 class="text-sm font-bold text-slate-800">Workforce State</h2>
+                    <div class="flex gap-4 text-[10px] text-slate-500 font-medium tracking-wide uppercase">
+                        <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-cyan-400"></span> Track A</span>
+                        <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-blue-500"></span> Track B</span>
+                    </div>
                 </div>
-              ))}
+                <div class="overflow-y-auto flex-1">
+                    <table class="w-full text-left text-xs text-slate-600 border-collapse">
+                        <thead class="bg-slate-50 sticky top-0 z-10">
+                            <tr>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200 pl-4">Expert ID</th>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200">Track</th>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200">Status</th>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200">Tier</th>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200">Pass Rate</th>
+                                <th class="p-3 font-semibold text-slate-500 border-b border-slate-200 w-1/4">History</th>
+                            </tr>
+                        </thead>
+                        <tbody id="workers-tbody" class="divide-y divide-slate-100"></tbody>
+                    </table>
+                </div>
             </div>
-          </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200 flex flex-col flex-1 shadow-sm overflow-hidden">
+                <div class="px-4 py-3 bg-white border-b border-slate-100 flex justify-between items-center">
+                    <h2 class="text-sm font-bold text-slate-800">Live Pipeline Queue <span class="text-slate-400 font-normal ml-1">(Requires 3 Passes)</span></h2>
+                </div>
+                <div id="tasks-container" class="overflow-y-auto p-3 flex-1 space-y-2 bg-slate-50/50"></div>
+            </div>
         </div>
 
-        {/* COLUMN 3: TERMINAL LOGS */}
-        <div className="bg-[#0D1117] rounded-xl border border-neutral-800 flex flex-col xl:col-span-1 shadow-inner h-full overflow-hidden font-mono">
-          <div className="p-2 border-b border-neutral-800 bg-[#161B22] flex items-center justify-between">
-            <div className="flex gap-1.5 pl-1">
-              <div className="w-2.5 h-2.5 rounded-full bg-red-500/80"></div>
-              <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/80"></div>
-              <div className="w-2.5 h-2.5 rounded-full bg-green-500/80"></div>
+        <!-- COLUMN 3: TERMINAL LOGS -->
+        <div class="bg-white rounded-2xl border border-slate-200 flex flex-col xl:col-span-1 shadow-sm h-[400px] xl:h-full overflow-hidden font-mono">
+            <div class="px-4 py-3 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+                <div class="flex gap-1.5">
+                    <div class="w-2.5 h-2.5 rounded-full bg-rose-400"></div>
+                    <div class="w-2.5 h-2.5 rounded-full bg-amber-400"></div>
+                    <div class="w-2.5 h-2.5 rounded-full bg-emerald-400"></div>
+                </div>
+                <span class="text-[10px] text-slate-400 font-bold tracking-wider uppercase">docker-agent-logs</span>
             </div>
-            <span className="text-[10px] text-neutral-500 font-bold pr-2">docker-agent-logs</span>
-          </div>
-          <div className="overflow-y-auto flex-1 p-3 space-y-1.5 text-[11px] tracking-tight leading-relaxed">
-            {db.logs.map((log) => (
-              <div key={log.id} className="flex gap-2 break-words">
-                <span className="text-neutral-600 shrink-0 w-[70px] text-right">[{log.agent}]</span>
-                <span className={`${log.color} flex-1`}>{log.msg}</span>
-              </div>
-            ))}
-            <div ref={logsEndRef} />
-          </div>
+            <div id="logs-container" class="overflow-y-auto flex-1 p-4 space-y-2 text-[11px] text-slate-600 bg-[#FAFAFA]"></div>
+        </div>
+
+    </div>
+
+    <!-- AGENT INSPECTOR MODAL -->
+    <div id="agent-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 md:p-12 bg-slate-900/20 backdrop-blur-sm opacity-0 transition-opacity duration-200">
+        <div class="bg-white border border-slate-200 rounded-3xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col overflow-hidden transform scale-95 transition-transform duration-200" id="agent-modal-content">
+            <!-- Modal Header -->
+            <div class="flex justify-between items-center px-6 py-4 border-b border-slate-100 bg-white">
+                <div class="flex items-center gap-3">
+                    <div id="modal-icon" class="w-3 h-3 rounded-full"></div>
+                    <h2 id="modal-title" class="text-xl font-bold text-slate-900">Agent Inspector</h2>
+                </div>
+                <button onclick="closeAgentModal()" class="text-slate-400 hover:text-slate-700 bg-slate-50 hover:bg-slate-100 rounded-lg p-1.5 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <!-- Modal Body -->
+            <div id="modal-body" class="flex-1 overflow-y-auto bg-slate-50 p-0 text-sm">
+                <!-- Rendered Dynamically -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DATA & STATE ---
+        const DB = {
+            tasks: [], workers: [], submissions: [], signoffs: [], logs: [],
+            metrics: { tasks_generated: 0, solutions_accepted: 0, tasks_failed: 0, total_spent: 0, fully_completed_tasks: 0 },
+            
+            internals: {
+                repos: [
+                    { name: 'pydantic/pydantic', generated: 0, accepted: 0, status: 'Live' },
+                    { name: 'sqlglot/sqlglot', generated: 0, accepted: 0, status: 'Live' }
+                ],
+                available_repos: ['structlog/structlog', 'polars/polars', 'pytest-dev/pytest'],
+                pipeline: [], 
+                recruiting: [],
+                pm: {
+                    instructions: `## SWE-Data Educational Patch Guide v1.6\n\n**Mission:** Write robust, minimal patches that pass failing tests without side effects.\n\n### Core Principles\n* **Minimal Scope:** Only change lines directly related to the test failure.\n* **No Hardcoding:** If a test expects \`5\`, do not return \`5\` explicitly. Fix the underlying logic.\n* **Environment:** Assume Python 3.10. Do not install new dependencies.\n\n### 🌟 Golden Example: What Good Looks Like\n\n**The Bug (sqlglot):** AST transform fails on nested \`SELECT\` queries because the dialect engine drops the outer scope.\n\n**Bad Patch (Anti-Pattern):**\n\`\`\`python\n# BAD: Hardcoding the specific test query signature\nif query.name == "nested_select_test_case_1":\n    return parse_nested(query, preserve_scope=True)\n\`\`\`\n> *Why it fails QC:* Fails secondary LLM check for hardcoding test strings. Brittle.\n\n**Golden Patch:**\n\`\`\`python\n# GOOD: Fixing the root logic in the dialect processor\n# We ensure scope preservation is passed recursively to children.\nfor child in node.children:\n    transform_ast(child, dialect=self.dialect, preserve_scope=preserve_scope)\n\`\`\`\n> *Why it passes:* Solves the class of problem, not just the specific test instance.\n\n### Live Clarifications & Updates\n`,
+                    instruction_gaps: []
+                },
+                qc: [],
+                comms: { inbox: [], outbox: [] },
+                em: { weekly_ticks: 0, report: {} }
+            }
+        };
+
+        let isRunning = false;
+        let tick = 0;
+        let speed = 800;
+        let intervalId = null;
+        let activeModalAgent = null;
+
+        // --- UTILS ---
+        const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+        const generateId = (prefix) => `${prefix}_${Math.random().toString(36).substr(2, 6)}`;
+        const addLog = (agent, msg, color) => {
+            DB.logs.push({ id: generateId('log'), agent, msg, color });
+            if (DB.logs.length > 50) DB.logs.shift();
+        };
+
+        const pushCommOutbox = (type, to, msg) => {
+            DB.internals.comms.outbox.unshift({ id: generateId('msg'), tick, type, to, text: msg });
+            if (DB.internals.comms.outbox.length > 50) DB.internals.comms.outbox.pop();
+        };
+
+        // --- AGENT LOGIC (High Fidelity) ---
+
+        const pipelineAgent = () => {
+            DB.internals.repos.filter(r => r.status === 'Live').forEach(repo => {
+                const passRate = repo.generated > 0 ? (repo.accepted / repo.generated) : 1;
+                if (repo.generated > 15 && passRate < 0.40 && !DB.signoffs.some(s => s.payload?.retire_repo === repo.name)) {
+                    DB.signoffs.push({
+                        id: generateId('req'), type: 'retire_repo', agent: 'Pipeline Agent',
+                        title: `Retire Repo: ${repo.name} & Provision Replacement`,
+                        desc: `Acceptance rate for ${repo.name} has fallen to ${(passRate*100).toFixed(0)}%. Requesting retirement and provisioning of a backup repository.`,
+                        status: 'pending', payload: { retire_repo: repo.name, new_repo: DB.internals.available_repos[0] }
+                    });
+                    addLog('Pipeline', `Drafted sign-off to retire ${repo.name}.`, 'text-blue-600');
+                }
+            });
+
+            const validatingQueue = DB.tasks.filter(t => t.status === 'validating');
+            if (validatingQueue.length < 5) {
+                const liveRepos = DB.internals.repos.filter(r => r.status === 'Live');
+                if (liveRepos.length === 0) return;
+
+                const batch = 2;
+                DB.internals.pipeline.unshift({ id: generateId('ast'), tick, action: `SWE-smith run. Target: ${batch} tasks. Output to Validation Queue.` });
+                
+                for (let i = 0; i < batch; i++) {
+                    DB.metrics.tasks_generated += 1;
+                    const isTier2 = Math.random() > 0.6;
+                    const selectedRepo = liveRepos[randomInt(0, liveRepos.length - 1)];
+                    selectedRepo.generated += 1;
+                    
+                    if (Math.random() > 0.5) {
+                        DB.internals.pipeline.unshift({ id: generateId('ast'), tick, action: `Mutating ${selectedRepo.name}. Flipped condition. 4 tests broken. Assigned Tier ${isTier2?2:1}. Sent to validation.` });
+                    }
+
+                    DB.tasks.push({
+                        id: `TASK-${DB.metrics.tasks_generated}`, repo: selectedRepo.name, tier: isTier2 ? 2 : 1,
+                        desc: isTier2 ? 'Fix complex interaction bug' : 'Handle missed edge case',
+                        status: 'validating', assigned_to: null, tests_broken: randomInt(1, 8),
+                        solutions: [] 
+                    });
+                }
+                addLog('Pipeline', 'Generated 2 tasks to Track A validation.', 'text-blue-600');
+                if(DB.internals.pipeline.length > 50) DB.internals.pipeline.length = 50;
+            }
+        };
+
+        const recruitingAgent = () => {
+            const unassignedTasks = DB.tasks.filter(t => t.status === 'unassigned').length;
+            const validationTasks = DB.tasks.filter(t => t.status === 'validating').length;
+            
+            const activeWriters = DB.workers.filter(w => w.status !== 'offboarded' && w.track === 'B').length;
+            const activeValidators = DB.workers.filter(w => w.status !== 'offboarded' && w.track === 'A').length;
+            
+            const pendingHires = DB.signoffs.filter(s => s.type === 'hire' && s.status === 'pending').length;
+            
+            if (Math.random() > 0.6) {
+                const track = Math.random() > 0.3 ? 'B (Writer)' : 'A (Validator)';
+                const isGood = Math.random() > 0.4;
+                DB.internals.recruiting.unshift({
+                    id: generateId('cand'), name: `expert_${randomInt(100,999)}`, track: track.charAt(0),
+                    github: isGood ? 'Pass' : 'Warn', interview: 'Pass', 
+                    status: isGood ? 'Screened - Ready' : 'Rejected (Flag)', flags: isGood ? [] : ['Low activity']
+                });
+                if(DB.internals.recruiting.length > 40) DB.internals.recruiting.length = 40;
+            }
+
+            if (pendingHires === 0) {
+                let targetTrack = null;
+                let needed = 0;
+                if (unassignedTasks > (activeWriters * 2) || activeWriters < 2) { targetTrack = 'B'; needed = 2; }
+                else if (validationTasks > (activeValidators * 3) || activeValidators < 1) { targetTrack = 'A'; needed = 1; }
+
+                if (targetTrack) {
+                    const ready = DB.internals.recruiting.filter(c => c.status === 'Screened - Ready' && c.track === targetTrack);
+                    if (ready.length >= needed) {
+                        DB.signoffs.push({
+                            id: generateId('req'), type: 'hire', agent: 'Recruiting Agent',
+                            title: `Approve Hire: ${needed} Track ${targetTrack} Experts`,
+                            desc: `Queue depth critically high for Track ${targetTrack}. Proposing batch hire from pre-screened pool.`,
+                            status: 'pending', payload: { count: needed, track: targetTrack }
+                        });
+                        addLog('Recruiting', `Drafted sign-off to hire Track ${targetTrack} experts.`, 'text-purple-600');
+                    }
+                }
+            }
+        };
+
+        const pmAgent = () => {
+            DB.workers.filter(w => w.status === 'working').forEach(w => {
+                w.ticks_working = (w.ticks_working || 0) + 1;
+                if (w.ticks_working > (w.track === 'A' ? 6 : 15)) { 
+                    const task = DB.tasks.find(t => t.id === w.current_task);
+                    if (task) { task.status = w.track === 'A' ? 'validating' : 'unassigned'; task.assigned_to = null; }
+                    w.status = 'idle'; w.current_task = null; w.ticks_working = 0;
+                    pushCommOutbox('warning', w.id, `Task timeout. Task returned to queue.`);
+                    addLog('PM Agent', `Reassigned ${task?.id} due to timeout.`, 'text-amber-600');
+                }
+            });
+
+            const idleWorkers = DB.workers.filter(w => w.status === 'idle');
+            const validationTasks = DB.tasks.filter(t => t.status === 'validating');
+            const unassignedWritersTasks = DB.tasks.filter(t => t.status === 'unassigned');
+
+            idleWorkers.forEach(worker => {
+                if (worker.track === 'A') {
+                    if (validationTasks.length > 0) {
+                        const task = validationTasks.shift();
+                        task.status = 'working'; task.assigned_to = worker.id;
+                        worker.status = 'working'; worker.current_task = task.id; worker.ticks_working = 0;
+                    }
+                } else {
+                    const eligibleIdx = unassignedWritersTasks.findIndex(t => t.tier <= worker.tier && !t.solutions.includes(worker.id));
+                    if (eligibleIdx !== -1) {
+                        const task = unassignedWritersTasks.splice(eligibleIdx, 1)[0];
+                        task.status = 'working'; task.assigned_to = worker.id;
+                        worker.status = 'working'; worker.current_task = task.id; worker.ticks_working = 0;
+                        addLog('PM Agent', `Assigned ${task.id} to writer ${worker.id}`, 'text-slate-500');
+                    }
+                }
+            });
+
+            DB.workers.forEach(w => {
+                if (w.status === 'offboarded') return;
+                if (w.history.length >= 3) {
+                    const recent = w.history.slice(-3);
+                    const passes = recent.filter(r => r === 'pass').length;
+                    w.pass_rate = passes / recent.length;
+
+                    if (w.track === 'B' && w.tier === 1 && w.pass_rate >= 0.8 && !w.has_been_promoted) {
+                        w.tier = 2; w.has_been_promoted = true;
+                        pushCommOutbox('promotion', w.id, `You've passed the gating protocol. Promoted to Tier 2.`);
+                        addLog('PM Agent', `Promoted ${w.id} to Tier 2.`, 'text-indigo-600');
+                    }
+                    
+                    if (w.pass_rate < 0.3 && w.history.length >= 4 && !DB.signoffs.some(s => s.payload?.worker_id === w.id && s.status === 'pending')) {
+                        DB.signoffs.push({
+                            id: generateId('req'), type: 'dismiss', agent: 'PM Agent',
+                            title: `Offboard Underperformer: ${w.id}`,
+                            desc: `Expert ${w.id} has a pass rate of ${(w.pass_rate*100).toFixed(0)}%. Requesting dismissal.`,
+                            status: 'pending', payload: { worker_id: w.id }
+                        });
+                        addLog('PM Agent', `Drafted sign-off to dismiss ${w.id}.`, 'text-rose-600');
+                    }
+                }
+            });
+        };
+
+        const workerExecutionAndExpertSupport = () => {
+            DB.workers.filter(w => w.status === 'working').forEach(worker => {
+                const task = DB.tasks.find(t => t.id === worker.current_task);
+                if (!task) return;
+
+                if (worker.track === 'A') {
+                    if (Math.random() > 0.6) {
+                        const approved = Math.random() > 0.15; 
+                        if (approved) {
+                            task.status = 'unassigned'; task.assigned_to = null;
+                            worker.history.push('pass'); 
+                        } else {
+                            task.status = 'rejected_by_validator'; task.assigned_to = null;
+                            worker.history.push('pass');
+                        }
+                        worker.status = 'idle'; worker.current_task = null;
+                    }
+                } else {
+                    if (Math.random() > 0.98 && !worker.asked_support) {
+                        worker.asked_support = true;
+                        DB.internals.comms.inbox.unshift({ 
+                            id: generateId('inq'), tick, from: worker.id, 
+                            text: "Is it acceptable to add a new dependency in pyproject.toml for this fix?", status: 'pending' 
+                        });
+                    }
+
+                    if (Math.random() > 0.75) { 
+                        const isSuccess = Math.random() < worker.skill;
+                        let errorType = null;
+                        if (!isSuccess) errorType = Math.random() > 0.5 ? 'AssertionError: Expected 4, got 5' : 'Timeout: Pytest exceeded 600s';
+                        
+                        DB.submissions.push({
+                            id: generateId('sub'), task_id: task.id, worker_id: worker.id,
+                            status: 'pending_qc', is_success: isSuccess, error: errorType
+                        });
+                        task.status = 'in_qc'; worker.status = 'idle'; worker.current_task = null; worker.asked_support = false;
+                    }
+                }
+            });
+        };
+
+        const commsAgentSupportResponse = () => {
+            DB.internals.comms.inbox.filter(msg => msg.status === 'pending').forEach(msg => {
+                msg.status = 'replied';
+                if (msg.text.includes('dependency')) {
+                    msg.reply = "Do not add dependencies unless explicitly requested. Follow existing repo mocking conventions.";
+                    pushCommOutbox('support', msg.from, msg.reply);
+                    
+                    const related = DB.internals.comms.inbox.filter(m => m.text.includes('dependency'));
+                    if (related.length > 1 && !DB.internals.pm.instruction_gaps.includes('Dependencies')) {
+                        DB.internals.pm.instruction_gaps.push('Dependencies');
+                        const newClarification = `\n* **[Tick ${tick}] Auto-Update (Dependencies):** Several experts have asked about adding packages to \`pyproject.toml\`. **NEVER add new external dependencies**. Mock internal services instead using standard libraries (\`unittest.mock\`).`;
+                        DB.internals.pm.instructions += newClarification;
+                        
+                        addLog('Comms Agent', 'Instruction Gap Detected. Updated PM Education Guide.', 'text-orange-600');
+                        document.getElementById('pm-badge').classList.remove('hidden'); 
+                    }
+                } else {
+                    msg.reply = "The Docker environment has been verified. Please run tests locally.";
+                    pushCommOutbox('support', msg.from, msg.reply);
+                }
+            });
+        };
+
+        const qcAgent = () => {
+            const pending = DB.submissions.filter(s => s.status === 'pending_qc');
+            pending.forEach(sub => {
+                const task = DB.tasks.find(t => t.id === sub.task_id);
+                const worker = DB.workers.find(w => w.id === sub.worker_id);
+                const repoObj = DB.internals.repos.find(r => r.name === task.repo);
+                
+                if (sub.is_success) {
+                    let isDiversityFlagged = false;
+                    let isCheating = false;
+
+                    if (task.solutions.length > 0 && Math.random() > 0.85) {
+                        isDiversityFlagged = true;
+                        isCheating = Math.random() > 0.5; 
+                    }
+
+                    if (isDiversityFlagged && isCheating) {
+                        sub.status = 'returned'; 
+                        task.status = 'unassigned'; 
+                        task.assigned_to = null; 
+                        worker.status = 'offboarded'; 
+                        worker.history.push('fail');
+                        
+                        DB.internals.qc.unshift({ id: generateId('eval'), tick, task: task.id, worker: worker.id, result: 'FAIL (PLAGIARISM)', note: `Autonomous decision: High token overlap confirmed as cheating.` });
+                        pushCommOutbox('error', worker.id, `Notice: Your contract has been terminated due to policy violation (Code Plagiarism on ${task.id}).`);
+                        addLog('QC Agent', `Auto-rejected ${task.id} & offboarded ${worker.id} for plagiarism.`, 'text-rose-600 font-bold');
+                    } else {
+                        sub.status = 'accepted'; 
+                        worker.history.push('pass');
+                        task.solutions.push(worker.id);
+                        DB.metrics.solutions_accepted += 1; 
+                        DB.metrics.total_spent += (task.tier === 1 ? 25 : 50); 
+                        if(repoObj) repoObj.accepted += 1;
+                        
+                        if (isDiversityFlagged && !isCheating) {
+                            DB.internals.qc.unshift({ id: generateId('eval'), tick, task: task.id, worker: worker.id, result: 'PASS (FLAG CLEARED)', note: `Similarity flagged but judged coincidental. Code is independent.` });
+                            addLog('QC Agent', `PASS: ${task.id} by ${worker.id} (Flag Cleared)`, 'text-emerald-600');
+                        } else {
+                            DB.internals.qc.unshift({ id: generateId('eval'), tick, task: task.id, worker: worker.id, result: 'PASS (CLEAN)', note: `Tests pass. Diversity check OK.` });
+                            addLog('QC Agent', `PASS: ${task.id} by ${worker.id}`, 'text-emerald-600');
+                        }
+                        pushCommOutbox('success', worker.id, `Solution accepted for ${task.id}. Payment credited.`);
+
+                        if (task.solutions.length >= 3) {
+                            task.status = 'completed';
+                            DB.metrics.fully_completed_tasks += 1;
+                            addLog('Pipeline', `Task ${task.id} fully completed (3/3 solutions).`, 'text-teal-600');
+                        } else {
+                            task.status = 'unassigned';
+                            task.assigned_to = null;
+                        }
+                    }
+
+                } else {
+                    sub.status = 'returned'; task.status = 'unassigned'; task.assigned_to = null; worker.history.push('fail');
+                    DB.metrics.tasks_failed += 1;
+                    DB.internals.qc.unshift({ id: generateId('eval'), tick, task: task.id, worker: worker.id, result: 'FAIL', note: sub.error });
+                    pushCommOutbox('error', worker.id, `Failed ${task.id}.\nTraceback snippet:\n${sub.error}`);
+                    addLog('QC Agent', `FAIL: ${task.id}`, 'text-rose-600');
+                }
+                if(DB.internals.qc.length > 40) DB.internals.qc.length = 40;
+            });
+        };
+
+        const engagementManagerAgent = () => {
+            DB.internals.em.weekly_ticks += 1;
+            
+            if (DB.internals.em.weekly_ticks % 10 === 0) {
+                const acceptedSolutions = DB.metrics.solutions_accepted;
+                const severeQCFails = DB.internals.qc.filter(q => q.result.includes('FAIL (PLAGIARISM)')).length;
+                const finalQualityPassRate = (acceptedSolutions + severeQCFails) > 0 ? acceptedSolutions / (acceptedSolutions + severeQCFails) : 1.0;
+                
+                const targetPace = tick * 0.5; 
+                const actualPace = DB.metrics.solutions_accepted;
+                
+                let prHealth = finalQualityPassRate >= 0.95 ? 'Green' : finalQualityPassRate >= 0.90 ? 'Yellow' : 'Red';
+                let paceHealth = actualPace >= targetPace ? 'Green' : (targetPace - actualPace < 10) ? 'Yellow' : 'Red';
+
+                DB.internals.em.report = {
+                    pass_rate: { val: (finalQualityPassRate*100).toFixed(1)+'%', status: prHealth },
+                    pace: { val: `${actualPace} / ${targetPace.toFixed(0)}`, status: paceHealth },
+                    projected_finish: tick + ((900 - actualPace) * (tick / (actualPace || 1))),
+                };
+            }
+        };
+
+        // --- RENDER MODALS (The Inspector Views) ---
+        
+        const openAgentModal = (agent) => {
+            activeModalAgent = agent;
+            const modal = document.getElementById('agent-modal');
+            const content = document.getElementById('agent-modal-content');
+            
+            if (agent === 'PM') document.getElementById('pm-badge').classList.add('hidden');
+            if (agent === 'Comms') document.getElementById('comms-badge').classList.add('hidden');
+
+            modal.classList.remove('hidden');
+            setTimeout(() => { modal.classList.remove('opacity-0'); content.classList.remove('scale-95'); }, 10);
+            renderModalContent();
+        };
+
+        const closeAgentModal = () => {
+            activeModalAgent = null;
+            const modal = document.getElementById('agent-modal');
+            const content = document.getElementById('agent-modal-content');
+            modal.classList.add('opacity-0'); content.classList.add('scale-95');
+            setTimeout(() => { modal.classList.add('hidden'); }, 200);
+        };
+
+        const renderModalContent = () => {
+            if (!activeModalAgent) return;
+            const titleEl = document.getElementById('modal-title');
+            const iconEl = document.getElementById('modal-icon');
+            const bodyEl = document.getElementById('modal-body');
+            let html = '';
+
+            if (activeModalAgent === 'Pipeline') {
+                titleEl.textContent = 'Pipeline Agent & Repo Lifecycle';
+                iconEl.className = 'w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]';
+                html = `
+                    <div class="grid grid-cols-2 h-full min-h-[500px]">
+                        <div class="border-r border-slate-200 flex flex-col bg-slate-50">
+                            <div class="bg-white p-3 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wide">SWE-smith Generation Log</div>
+                            <div class="p-4 font-mono text-[11px] text-blue-700 flex-1 overflow-y-auto space-y-2">
+                                ${DB.internals.pipeline.length ? DB.internals.pipeline.map(l => `<div><span class="text-slate-400">[T${l.tick}]</span> ${l.action}</div>`).join('') : '<div class="text-slate-400">Waiting for generation trigger...</div>'}
+                            </div>
+                        </div>
+                        <div class="flex flex-col bg-white p-6 gap-5">
+                            <div class="text-sm font-bold text-slate-800 border-b border-slate-100 pb-2">Active Repositories</div>
+                            <div class="space-y-4">
+                                ${DB.internals.repos.map(r => {
+                                    const pr = r.generated > 0 ? (r.accepted/r.generated)*100 : 100;
+                                    const color = r.status==='Retired'?'bg-slate-300':pr>50?'bg-emerald-500':pr>35?'bg-amber-500':'bg-rose-500';
+                                    return `
+                                    <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm opacity-${r.status==='Retired'?50:100}">
+                                        <div class="flex justify-between items-center mb-1">
+                                            <span class="font-mono text-xs font-semibold text-slate-700">${r.name}</span>
+                                            <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${r.status==='Live'?'bg-emerald-50 text-emerald-700':'bg-slate-100 text-slate-500'}">${r.status}</span>
+                                        </div>
+                                        <div class="text-[11px] text-slate-500 mt-2">Acceptance Rate: ${pr.toFixed(0)}% (${r.accepted}/${r.generated})</div>
+                                        <div class="w-full bg-slate-100 h-2 rounded-full mt-2 overflow-hidden"><div class="${color} h-2 rounded-full" style="width: ${pr}%"></div></div>
+                                    </div>`;
+                                }).join('')}
+                            </div>
+                        </div>
+                    </div>`;
+            } 
+            else if (activeModalAgent === 'Recruiting') {
+                titleEl.textContent = 'Recruiting Pipeline & Funnel';
+                iconEl.className = 'w-3 h-3 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)]';
+                html = `
+                    <div class="p-6 bg-white min-h-[500px]">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-slate-800 font-bold">Rent-A-Human Screening Queue</h3>
+                        </div>
+                        <div class="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                            <table class="w-full text-left text-xs text-slate-600 border-collapse bg-white">
+                                <thead class="bg-slate-50 border-b border-slate-200 text-slate-500">
+                                    <tr><th class="p-3 pl-4">Candidate ID</th><th class="p-3">Track</th><th class="p-3">GitHub Auth</th><th class="p-3">Status</th><th class="p-3">Flags</th></tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100">
+                                    ${DB.internals.recruiting.length ? DB.internals.recruiting.map(c => `
+                                        <tr class="hover:bg-slate-50 transition-colors">
+                                            <td class="p-3 pl-4 font-mono font-medium text-slate-800">${c.name}</td>
+                                            <td class="p-3"><span class="px-2 py-0.5 rounded font-bold ${c.track==='A'?'bg-cyan-50 text-cyan-700':'bg-blue-50 text-blue-700'}">${c.track}</span></td>
+                                            <td class="p-3"><span class="${c.github==='Pass'?'text-emerald-600':'text-amber-600'} font-medium">${c.github}</span></td>
+                                            <td class="p-3">
+                                                <span class="px-2 py-1 rounded-full text-[10px] uppercase font-bold ${c.status.includes('Rejected')?'bg-rose-50 text-rose-700 border border-rose-100':'bg-emerald-50 text-emerald-700 border border-emerald-100'}">${c.status}</span>
+                                            </td>
+                                            <td class="p-3 text-[10px] text-slate-400">${c.flags.join(', ') || '-'}</td>
+                                        </tr>
+                                    `).join('') : '<tr><td colspan="5" class="p-6 text-center text-slate-400">Waiting for sourcing run...</td></tr>'}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>`;
+            }
+            else if (activeModalAgent === 'PM') {
+                titleEl.textContent = 'Project Management & Education Guide';
+                iconEl.className = 'w-3 h-3 rounded-full bg-slate-400 shadow-[0_0_8px_rgba(148,163,184,0.5)]';
+                const parseMd = (md) => {
+                    return md.replace(/### (.*?)\n/g, '<h2>$1</h2>')
+                             .replace(/## (.*?)\n/g, '<h1>$1</h1>')
+                             .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                             .replace(/\* (.*?)\n/g, '<ul><li>$1</li></ul>')
+                             .replace(/`([^`]+)`/g, '<code>$1</code>')
+                             .replace(/```python\n([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+                             .replace(/> (.*?)\n/g, '<blockquote>$1</blockquote>');
+                };
+                html = `
+                    <div class="grid grid-cols-2 h-full min-h-[500px]">
+                        <div class="border-r border-slate-200 p-6 flex flex-col bg-white">
+                            <h3 class="text-slate-800 font-bold mb-4 flex justify-between items-center">
+                                Live Educational SOP
+                                <span class="text-[10px] font-semibold uppercase bg-slate-100 px-2 py-1 rounded text-slate-500 tracking-wider">Maintained by PM & Comms</span>
+                            </h3>
+                            <div class="bg-white border border-slate-200 rounded-xl p-6 flex-1 overflow-y-auto markdown shadow-sm">
+                                ${parseMd(DB.internals.pm.instructions)}
+                            </div>
+                        </div>
+                        <div class="p-6 flex flex-col bg-slate-50">
+                            <h3 class="text-slate-800 font-bold mb-4">Track B: Worker Gating (Tier 1)</h3>
+                            <div class="space-y-3 flex-1 overflow-y-auto">
+                                ${DB.workers.filter(w=>w.track==='B' && w.tier===1 && w.status!=='offboarded').map(w => `
+                                    <div class="bg-white p-4 rounded-xl border border-slate-200 flex justify-between items-center shadow-sm">
+                                        <div>
+                                            <div class="font-mono text-sm font-semibold text-slate-800">${w.id}</div>
+                                            <div class="text-[11px] text-slate-500 mt-1">Completed: ${w.history.length}/3 for eval. Pass Rate: ${(w.pass_rate*100).toFixed(0)}%</div>
+                                        </div>
+                                        <div class="w-20 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                                            <div class="bg-slate-400 h-full" style="width: ${(w.history.length/3)*100}%"></div>
+                                        </div>
+                                    </div>
+                                `).join('') || '<div class="text-slate-400 text-sm">No Tier 1 writers in gating.</div>'}
+                            </div>
+                        </div>
+                    </div>`;
+            }
+            else if (activeModalAgent === 'QC') {
+                titleEl.textContent = 'Deterministic QC & LLM Secondary Reviews';
+                iconEl.className = 'w-3 h-3 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]';
+                html = `
+                    <div class="p-6 bg-slate-50 min-h-[500px]">
+                        <h3 class="text-slate-800 font-bold mb-4">Recent Quality Evaluations</h3>
+                        <div class="space-y-4">
+                            ${DB.internals.qc.length ? DB.internals.qc.map(q => `
+                                <div class="bg-white border border-slate-200 p-4 rounded-xl flex flex-col gap-3 shadow-sm">
+                                    <div class="flex justify-between items-center text-xs">
+                                        <span class="font-mono text-slate-500">[T${q.tick}] Task: <span class="text-slate-800 font-semibold">${q.task}</span> | Worker: ${q.worker}</span>
+                                        <span class="font-bold px-2 py-1 rounded-md text-[10px] ${q.result.includes('FAIL')?'bg-rose-50 text-rose-700':q.result.includes('CLEARED')?'bg-emerald-50 text-emerald-700':'bg-emerald-50 text-emerald-700'}">${q.result}</span>
+                                    </div>
+                                    <div class="bg-slate-50 border border-slate-100 p-3 rounded-lg text-[11px] font-mono ${q.result.includes('FAIL')?'text-rose-600':'text-slate-600'} whitespace-pre-wrap leading-relaxed">${q.note}</div>
+                                </div>
+                            `).join('') : '<div class="text-slate-400">Awaiting submissions...</div>'}
+                        </div>
+                    </div>`;
+            }
+            else if (activeModalAgent === 'Comms') {
+                titleEl.textContent = 'Comms & Support Center';
+                iconEl.className = 'w-3 h-3 rounded-full bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]';
+                
+                html = `
+                    <div class="grid grid-cols-2 h-[600px]">
+                        <div class="border-r border-slate-200 bg-white flex flex-col">
+                            <div class="p-4 border-b border-slate-100 text-xs font-bold text-slate-500 uppercase tracking-wide">Expert Support Inbox</div>
+                            <div class="flex-1 overflow-y-auto p-5 space-y-4">
+                                ${DB.internals.comms.inbox.length ? DB.internals.comms.inbox.map(m => `
+                                    <div class="bg-slate-50 border border-slate-200 p-4 rounded-xl shadow-sm">
+                                        <div class="flex justify-between text-[10px] text-slate-400 mb-2 font-mono">
+                                            <span class="font-medium text-slate-600">From: ${m.from}</span><span>Tick ${m.tick}</span>
+                                        </div>
+                                        <div class="text-sm text-slate-700 leading-relaxed">${m.text}</div>
+                                        ${m.reply ? `<div class="mt-3 pt-3 border-t border-slate-200 text-xs text-orange-700"><span class="font-bold">Auto-Reply:</span> ${m.reply}</div>` : ''}
+                                    </div>
+                                `).join('') : '<div class="text-slate-400 text-sm text-center mt-10">Inbox zero.</div>'}
+                            </div>
+                        </div>
+                        <div class="bg-slate-50 flex flex-col">
+                            <div class="p-4 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wide bg-white">System Outbox (Transmissions)</div>
+                            <div class="flex-1 overflow-y-auto p-5 space-y-4">
+                                ${DB.internals.comms.outbox.length ? DB.internals.comms.outbox.map(m => {
+                                    let bg = 'bg-white', text = 'text-slate-600', border = 'border-slate-200', tag = 'text-slate-500 bg-slate-100';
+                                    if(m.type==='error') { text='text-rose-700'; tag='text-rose-700 bg-rose-50'; border='border-rose-100'; bg='bg-white'; }
+                                    if(m.type==='success') { text='text-emerald-700'; tag='text-emerald-700 bg-emerald-50'; border='border-emerald-100'; bg='bg-white'; }
+                                    if(m.type==='warning') { text='text-amber-700'; tag='text-amber-700 bg-amber-50'; border='border-amber-100'; bg='bg-white'; }
+                                    if(m.type==='promotion') { text='text-indigo-700'; tag='text-indigo-700 bg-indigo-50'; border='border-indigo-100'; bg='bg-white'; }
+                                    return `
+                                    <div class="${bg} border ${border} p-4 rounded-xl shadow-sm">
+                                        <div class="flex justify-between items-center mb-2">
+                                            <span class="font-mono text-[10px] font-medium text-slate-500">To: ${m.to}</span>
+                                            <span class="text-[10px] px-2 py-0.5 rounded-md font-bold uppercase ${tag}">${m.type}</span>
+                                        </div>
+                                        <div class="text-sm ${text} whitespace-pre-wrap leading-relaxed">${m.text}</div>
+                                    </div>`;
+                                }).join('') : '<div class="text-slate-400 text-sm text-center mt-10">Outbox empty.</div>'}
+                            </div>
+                        </div>
+                    </div>`;
+            }
+            else if (activeModalAgent === 'Engagement') {
+                titleEl.textContent = 'Engagement Manager (Client Reporting)';
+                iconEl.className = 'w-3 h-3 rounded-full bg-teal-500 shadow-[0_0_8px_rgba(20,184,166,0.5)]';
+                const r = DB.internals.em.report;
+                const getDot = (status) => `<span class="w-2.5 h-2.5 rounded-full inline-block shadow-sm ${status==='Green'?'bg-emerald-500':status==='Yellow'?'bg-amber-500':'bg-rose-500'}"></span>`;
+                html = `
+                    <div class="p-8 bg-slate-50 min-h-[500px]">
+                        <h3 class="text-xl text-slate-900 font-bold border-b border-slate-200 pb-4 mb-8">Weekly Client Pulse</h3>
+                        
+                        <div class="grid grid-cols-3 gap-6 mb-10">
+                            <div class="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm">
+                                <div class="text-xs text-slate-400 font-bold uppercase tracking-wider mb-3 flex justify-between items-center">
+                                    Final Data Quality ${r.pass_rate ? getDot(r.pass_rate.status) : ''}
+                                </div>
+                                <div class="text-4xl font-mono text-slate-800 font-medium">${r.pass_rate?.val || '--%'}</div>
+                                <div class="text-xs text-slate-400 mt-2 font-medium">Target: >95%</div>
+                            </div>
+                            <div class="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm">
+                                <div class="text-xs text-slate-400 font-bold uppercase tracking-wider mb-3 flex justify-between items-center">
+                                    Delivery Pace ${r.pace ? getDot(r.pace.status) : ''}
+                                </div>
+                                <div class="text-4xl font-mono text-slate-800 font-medium">${r.pace?.val || '-- / --'}</div>
+                                <div class="text-xs text-slate-400 mt-2 font-medium">Actual vs Expected</div>
+                            </div>
+                            <div class="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm">
+                                <div class="text-xs text-slate-400 font-bold uppercase tracking-wider mb-3 flex justify-between items-center">
+                                    Projected Finish
+                                </div>
+                                <div class="text-4xl font-mono text-slate-800 font-medium">Tick ${r.projected_finish ? r.projected_finish.toFixed(0) : '--'}</div>
+                                <div class="text-xs text-slate-400 mt-2 font-medium">Based on current velocity</div>
+                            </div>
+                        </div>
+
+                        <div class="bg-white border border-slate-200 p-8 rounded-2xl shadow-sm">
+                            <div class="text-base text-slate-800 font-bold mb-6">Goal Burn-down (300 tasks × 3 solutions = 900 solutions)</div>
+                            <div class="flex justify-between text-sm font-mono text-slate-500 font-medium mb-3">
+                                <span>0</span>
+                                <span class="text-teal-600 font-bold">${DB.metrics.solutions_accepted} / 900</span>
+                                <span>900</span>
+                            </div>
+                            <div class="w-full bg-slate-100 h-4 rounded-full overflow-hidden shadow-inner">
+                                <div class="bg-teal-500 h-full transition-all duration-1000 rounded-full" style="width: ${(DB.metrics.solutions_accepted / 900) * 100}%"></div>
+                            </div>
+                        </div>
+                    </div>`;
+            }
+
+            bodyEl.innerHTML = html;
+        };
+
+        // --- DOM UPDATES (Global Render) ---
+        const render = () => {
+            const activeWriters = DB.workers.filter(w => w.status !== 'offboarded' && w.track === 'B').length;
+            const activeValidators = DB.workers.filter(w => w.status !== 'offboarded' && w.track === 'A').length;
+            
+            document.getElementById('metric-ticks').textContent = tick;
+            document.getElementById('metric-queue').textContent = DB.tasks.filter(t=>t.status==='unassigned').length;
+            document.getElementById('metric-experts').textContent = `${activeValidators} / ${activeWriters}`;
+            
+            document.getElementById('metric-accepted').textContent = `${DB.metrics.solutions_accepted}`;
+            document.getElementById('metric-progress').style.width = `${(DB.metrics.solutions_accepted / 900) * 100}%`;
+            document.getElementById('metric-3x').textContent = DB.metrics.fully_completed_tasks;
+            
+            document.getElementById('metric-spend').textContent = `$${DB.metrics.total_spent}`;
+
+            // Executive Inbox
+            const pendingSignoffs = DB.signoffs.filter(s => s.status === 'pending');
+            const badge = document.getElementById('inbox-badge');
+            if (pendingSignoffs.length > 0) {
+                badge.textContent = pendingSignoffs.length; badge.classList.remove('hidden');
+            } else { badge.classList.add('hidden'); }
+
+            const signoffsHtml = pendingSignoffs.length === 0 ? 
+                `<div class="text-slate-400 text-sm text-center py-8 flex flex-col items-center"><svg class="w-8 h-8 mb-3 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>System nominal. No pending actions.</div>` :
+                pendingSignoffs.map(req => `
+                    <div class="bg-white border border-slate-200 p-4 rounded-xl shadow-sm flex flex-col gap-2">
+                        <div class="flex justify-between items-start">
+                            <span class="text-[10px] text-slate-500 font-bold tracking-wider uppercase bg-slate-100 px-2 py-1 rounded-md">${req.agent}</span>
+                        </div>
+                        <div class="text-sm text-slate-900 font-bold mt-1">${req.title}</div>
+                        <div class="text-xs text-slate-600 leading-relaxed">${req.desc}</div>
+                        <div class="flex gap-2 mt-3">
+                            <button onclick="handleSignoff('${req.id}', true)" class="flex-1 bg-slate-900 hover:bg-slate-800 text-white rounded-lg py-1.5 text-xs font-semibold transition-colors shadow-sm">Approve</button>
+                            <button onclick="handleSignoff('${req.id}', false)" class="flex-1 bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 rounded-lg py-1.5 text-xs font-semibold transition-colors">Reject</button>
+                        </div>
+                    </div>
+                `).join('');
+            document.getElementById('signoffs-container').innerHTML = signoffsHtml;
+
+            // Mini Comms Feed
+            const recentComms = DB.internals.comms.outbox.filter(m => m.type==='promotion' || m.type==='warning' || m.type==='error').slice(0,4);
+            document.getElementById('comms-container-mini').innerHTML = recentComms.length ? recentComms.map(msg => `
+                <div class="bg-white border border-slate-200 p-3 rounded-xl shadow-sm flex flex-col gap-1.5">
+                    <div class="flex justify-between items-center text-[10px]">
+                        <span class="text-slate-500 font-mono font-medium">To: ${msg.to}</span>
+                        <span class="${msg.type==='warning'?'text-amber-600 bg-amber-50':msg.type==='error'?'text-rose-600 bg-rose-50':'text-indigo-600 bg-indigo-50'} px-2 py-0.5 rounded-md uppercase font-bold tracking-wider">${msg.type}</span>
+                    </div>
+                    <div class="text-xs text-slate-600 truncate">${msg.text}</div>
+                </div>
+            `).join('') : '<div class="text-slate-400 text-xs text-center mt-6">No recent broadcasts.</div>';
+
+            const unreadInq = DB.internals.comms.inbox.filter(m => m.status === 'pending').length;
+            const cBadge = document.getElementById('comms-badge');
+            if (unreadInq > 0 && activeModalAgent !== 'Comms') {
+                cBadge.textContent = unreadInq; cBadge.classList.remove('hidden');
+            }
+
+            // Workforce Table
+            const workerStatusColor = (status) => status==='working'?'bg-blue-50 text-blue-700 border-blue-100':status==='idle'?'bg-emerald-50 text-emerald-700 border-emerald-100':'bg-slate-100 text-slate-500 border-slate-200';
+            document.getElementById('workers-tbody').innerHTML = DB.workers.slice().reverse().map(w => `
+                <tr class="hover:bg-slate-50/80 transition-colors ${w.status==='offboarded'?'opacity-40 bg-slate-50':''}">
+                    <td class="p-3 font-mono text-slate-800 font-medium pl-4">${w.id}</td>
+                    <td class="p-3">
+                        <span class="px-2 py-1 rounded-md border font-bold text-[10px] tracking-wide ${w.track==='A'?'bg-cyan-50 text-cyan-700 border-cyan-100':'bg-blue-50 text-blue-700 border-blue-100'}">Trk ${w.track}</span>
+                    </td>
+                    <td class="p-3"><span class="px-2 py-1 rounded-md border font-bold text-[10px] tracking-wide uppercase ${workerStatusColor(w.status)}">${w.status}</span></td>
+                    <td class="p-3 font-medium text-slate-600">${w.tier}</td>
+                    <td class="p-3 font-medium text-slate-600">${(w.pass_rate * 100).toFixed(0)}%</td>
+                    <td class="p-3 flex gap-1 flex-wrap items-center h-full pt-4">
+                        ${w.history.slice(-5).map(h => `<div class="w-2.5 h-2.5 rounded-full shadow-sm ${h==='pass'?'bg-emerald-400':'bg-rose-400'}"></div>`).join('')}
+                    </td>
+                </tr>
+            `).join('');
+
+            // Live Tasks
+            const taskStatusColor = (status) => {
+                if(status==='validating') return 'bg-cyan-50 text-cyan-700 border-cyan-100';
+                if(status==='unassigned') return 'bg-slate-100 text-slate-600 border-slate-200';
+                if(status==='working') return 'bg-blue-50 text-blue-700 border-blue-100';
+                if(status==='in_qc') return 'bg-purple-50 text-purple-700 border-purple-100';
+                if(status==='completed') return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+                return 'bg-rose-50 text-rose-700 border-rose-100'; 
+            };
+            document.getElementById('tasks-container').innerHTML = DB.tasks.slice(-50).reverse().map(t => `
+                <div class="bg-white border border-slate-200 p-3 rounded-xl flex justify-between items-center text-xs hover:border-slate-300 transition-colors shadow-sm">
+                    <div class="flex gap-3 items-center">
+                        <span class="font-mono ${t.status==='completed'?'text-emerald-600':'text-slate-500'} font-medium w-[60px]">${t.id}</span>
+                        <span class="px-2 py-0.5 rounded-md text-[10px] uppercase font-bold w-[70px] text-center border ${t.repo==='sqlglot/sqlglot'?'bg-amber-50 text-amber-700 border-amber-100':'bg-teal-50 text-teal-700 border-teal-100'}">${t.repo.split('/')[0]}</span>
+                        <span class="text-slate-700 font-medium truncate max-w-[80px] md:max-w-[150px]">${t.desc}</span>
+                    </div>
+                    <div class="flex gap-4 items-center">
+                        ${t.solutions.length > 0 ? `<span class="text-emerald-600 font-bold text-[11px] bg-emerald-50 px-2 py-0.5 rounded-md">(${t.solutions.length}/3)</span>` : ''}
+                        ${t.assigned_to ? `<span class="text-slate-400 font-mono text-[10px] font-medium hidden md:inline">Asg: ${t.assigned_to}</span>` : ''}
+                        <span class="px-2 py-1 border rounded-md text-[10px] uppercase font-bold tracking-wide w-[80px] text-center ${taskStatusColor(t.status)}">${t.status.replace(/_/g, ' ')}</span>
+                    </div>
+                </div>
+            `).join('');
+
+            // Terminal Logs
+            const logsContainer = document.getElementById('logs-container');
+            const wasAtBottom = logsContainer.scrollHeight - logsContainer.scrollTop <= logsContainer.clientHeight + 10;
+            
+            logsContainer.innerHTML = DB.logs.map(log => `
+                <div class="flex gap-2 break-words hover:bg-slate-100/80 rounded px-2 py-1 -mx-2 transition-colors">
+                    <span class="text-slate-400 font-medium shrink-0 w-[80px] text-right">[${log.agent}]</span>
+                    <span class="${log.color} flex-1 font-medium">${log.msg}</span>
+                </div>
+            `).join('');
+            
+            if(wasAtBottom) logsContainer.scrollTop = logsContainer.scrollHeight;
+
+            if (activeModalAgent) renderModalContent();
+        };
+
+        // --- GLOBAL ACTIONS ---
+        window.handleSignoff = (reqId, isApproved) => {
+            const req = DB.signoffs.find(s => s.id === reqId);
+            if (!req || req.status !== 'pending') return;
+
+            req.status = isApproved ? 'approved' : 'rejected';
+            
+            if (isApproved) {
+                if (req.type === 'hire') {
+                    for (let i=0; i<req.payload.count; i++) {
+                        const readyCandidates = DB.internals.recruiting.filter(c => c.status === 'Screened - Ready' && c.track === req.payload.track);
+                        const cand = readyCandidates.pop() || { name: `expert_${randomInt(10, 99)}` };
+                        if(cand.status) cand.status = 'Hired';
+
+                        DB.workers.push({
+                            id: cand.name, track: req.payload.track,
+                            skill: parseFloat((Math.random() * 0.6 + 0.35).toFixed(2)),
+                            tier: 1, status: 'idle', history: [], pass_rate: 0
+                        });
+                    }
+                    addLog('Executive', `Approved hiring of ${req.payload.count} Track ${req.payload.track} workers.`, 'text-slate-800');
+                } else if (req.type === 'dismiss') {
+                    const w = DB.workers.find(w => w.id === req.payload.worker_id);
+                    if (w) w.status = 'offboarded';
+                    pushCommOutbox('error', w.id, `Notice: Your contract has been terminated due to quality thresholds.`);
+                    addLog('Executive', `Approved dismissal of ${w.id}.`, 'text-slate-800');
+                } else if (req.type === 'retire_repo') {
+                    const oldRepo = DB.internals.repos.find(r => r.name === req.payload.retire_repo);
+                    if (oldRepo) oldRepo.status = 'Retired';
+                    DB.internals.repos.push({ name: req.payload.new_repo, generated: 0, accepted: 0, status: 'Live' });
+                    DB.internals.available_repos = DB.internals.available_repos.filter(r => r !== req.payload.new_repo);
+                    addLog('Executive', `Approved retirement of ${req.payload.retire_repo}. Provisioned ${req.payload.new_repo}.`, 'text-slate-800');
+                }
+            } else {
+                addLog('Executive', `Rejected ${req.type} request.`, 'text-slate-400');
+            }
+            render();
+        };
+
+        // --- SIMULATION LOOP ---
+        const tickLoop = () => {
+            tick++;
+            workerExecutionAndExpertSupport();
+            qcAgent();
+            commsAgentSupportResponse();
+            engagementManagerAgent();
+            if (tick % 2 === 0) pmAgent();
+            if (tick % 3 === 0) recruitingAgent();
+            if (tick % 4 === 0) pipelineAgent();
+            render();
+        };
+
+        const toggleSimulation = () => {
+            isRunning = !isRunning;
+            const btn = document.getElementById('toggle-btn');
+            if (isRunning) {
+                btn.textContent = '⏸ Pause Pipeline';
+                btn.className = 'px-6 py-2 rounded-lg font-semibold transition-all bg-rose-50 text-rose-600 border border-rose-200 hover:bg-rose-100 shadow-sm';
+                intervalId = setInterval(tickLoop, speed);
+            } else {
+                btn.textContent = '▶ Start Pipeline';
+                btn.className = 'px-6 py-2 rounded-lg font-semibold text-white shadow-sm transition-all bg-slate-900 hover:bg-slate-800';
+                clearInterval(intervalId);
+            }
+        };
+
+        // --- EVENT LISTENERS ---
+        document.getElementById('toggle-btn').addEventListener('click', toggleSimulation);
+        document.getElementById('speed-select').addEventListener('change', (e) => {
+            speed = parseInt(e.target.value);
+            if (isRunning) { clearInterval(intervalId); intervalId = setInterval(tickLoop, speed); }
+        });
+        
+        document.addEventListener('keydown', (e) => { if(e.key === 'Escape' && activeModalAgent) closeAgentModal(); });
+        document.getElementById('agent-modal').addEventListener('click', (e) => {
+            if(e.target.id === 'agent-modal') closeAgentModal();
+        });
+
+        render();
+
+    </script>
+</body>
+</html>
